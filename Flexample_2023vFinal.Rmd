@@ -1,0 +1,2111 @@
+---
+title: "`r paste0('Encendidos: ', format(params$date, '%d %B, %Y'))`" 
+output: 
+  flexdashboard::flex_dashboard:
+    logo: "TelevisaU.jpg"
+    theme: united
+    social: menu
+    vertical_layout: scroll
+params:
+  date:
+    input: date
+    label: "Selecciona la fecha que deseas:"
+    max: '2023-12-31'
+    min: '2017-01-01'
+    value: !r Sys.Date()-1
+---
+
+<style>
+.colored {
+  background-color: #DDDDDD;
+}
+.colored1 {
+  background-color: black;
+  color: white;
+}
+.navbar {
+    background: linear-gradient(to right, #ea1e63,#fb3f04);
+}
+.navbar-inverse .navbar-nav li.active a {
+  background-color: #ea1e63!important;
+}
+.navbar .navbar-nav .nav-link:hover {
+background-color: #ea1e63; 
+} 
+.navbar .navbar-nav .nav-link:focus {
+background-color: #ea1e63; 
+}
+.value-box > .inner {
+    color: black;
+    padding: 10px;
+    padding-left: 20px;
+    padding-right: 20px;
+}
+</style>
+
+
+```{r packages, include=FALSE}
+options(digits=22,scipen = 999)
+ 
+require(rio)
+require(shinydashboard)
+require(tidyverse)
+require(flexdashboard)
+require(reshape)
+require(dplyr)
+require(lubridate)
+require(ggplot2)
+require(tibble)
+require(data.table)
+require(reshape2)
+require(cowplot)
+require(shiny)
+require(kableExtra)
+require(knitr)
+require(gridExtra)
+require(readxl)
+require(stringr)
+require(formattable)
+```
+
+```{r lectura de datos, include=FALSE}
+DIRECTORIO <- "C:/Users/lenovo/Documents/Monica/Televisa/Dailytrack/DATA2/"
+
+# Rating real de los 15 canales del día a reportar
+rating_real <- read.table(file = paste0(DIRECTORIO,"RatingReal.txt"),
+                  sep = "|", header = TRUE,
+                  colClasses = c(NA, rep("character",5),"numeric"))
+names(rating_real) <- c("X", "date", "target", "channel", "timeband", "timeband2", "observed")
+
+rating_real <- rating_real %>% 
+  mutate(target = case_when(target == "BI_02_P 04+" ~ "PERSONAS_4+",
+                            target=="P 19-54 sin DE" ~ "PERSONAS_19-54_ABC+CD+",
+                            target=="Amas de Casa" ~ "AMAS"),
+         timeband=substr(timeband,1,5), 
+          channel= replace(channel, channel== "TV PAGADA 2018", "TV PAGADA")) %>% 
+  select(-X, -timeband2)
+
+# TAF original y ajustado para comparación vs rating real
+TAF_1 <- read.csv(paste0(DIRECTORIO,"taf_20231121_parte1.csv"),
+                     header = TRUE, colClasses = c(rep("character", 10), rep("numeric", 14)))
+
+TAF_2 <- read.csv(paste0(DIRECTORIO,"taf_20231121_parte2.csv"),
+                     header = TRUE, colClasses = c(rep("character", 10), rep("numeric", 14)))
+
+TAF <- bind_rows(TAF_1,TAF_2) %>% 
+  select(-observed)
+
+names(TAF)[1] <- "target"
+
+TAF <- TAF %>% 
+  filter(level== "BY TIMEBAND DAILY", 
+         #target == "PERSONAS_4+", ## Ver si funciona sin esto
+         strip %in% c("A", "AA", "AAA")) %>% 
+  mutate(timeband=substr(timeband, 1,5), 
+         channel= replace(channel, channel=="GALA TV", "NU9VE"),
+         channel = replace(channel, channel=="A+", "A MAS +")) %>% 
+  select(-network, -ratings_type)
+
+TAF_ajustado <- read_excel(paste0(DIRECTORIO,
+                                  "2. TAF AJUSTE Estimado de Audiencia 2023-11-27 2023-12-03.xlsx"),
+                           sheet = "AJUSTE") %>% 
+  select(Target, Channel, TimeBand, Date, TimeBand,`INF Rat%`,`SUP Rat%`) 
+
+# Rating miles 6-24 de los 15 canales del año actual y el previo
+rating_all_channels_624 <- read.table(paste0(DIRECTORIO,"ENCENDIDOS0624.txt"),
+                                            sep="|", header = FALSE,
+                                            dec = ".", numerals = "no.loss", skip = 2,
+                            colClasses = c(rep("character",3),"Date",rep("numeric",7)))
+names(rating_all_channels_624) <- c("X","Dominio","Channel","Fecha","Year","Month","Month.Day","Week","Personas 4+","Amas de Casa","P 19-54 sin DE")
+
+rating_all_channels_624  <- rating_all_channels_624 %>% 
+  mutate(Channel = case_when(Channel == "TOTAL ENCENDIDOS" ~ "ENCENDIDOS",
+                             Channel=="TV ABIERTA TOTAL" ~ "TV ABIERTA",
+                             Channel=="TV PAGADA 2018" ~ "TV PAGADA",
+                             TRUE ~ Channel)) %>% 
+  filter(Fecha <= params$date) %>%  
+  select(-X)
+
+# Para curvas de Encendido 
+Sys.setlocale("LC_TIME","C")
+encendidos <- read.table(paste0(DIRECTORIO,"EncendidosMXM.txt"),
+                         sep = "|", header = TRUE, 
+                         colClasses = c(NA, rep("character",2),"Date", rep("character",2),"numeric"))
+
+Sys.setlocale("LC_TIME","ES_ES.UTF8")
+encendidos <- encendidos %>% #encendidos[-1] %>% 
+  mutate(Week.Day = str_replace_all(Week.Day,"i\xe","ié")) %>% 
+  mutate(Target = case_when(Target == "BI_02_P 04+" ~ "Personas 4+",
+                            TRUE ~ Target),
+         Start.Time = substr(Start.Time,1,5)) %>% 
+  filter(Date<= params$date)
+```
+
+
+```{r Processing, include=FALSE}
+#Modificar este TAF
+datos_taf_rat <- TAF %>% 
+  left_join(rating_real, by=c("date", "target", "channel", "timeband")) %>% 
+  filter(date == params$date, target=="PERSONAS_4+") %>% 
+  mutate(In_30 = ifelse(observed<=Hi_30 & observed>=Lo_30, 1,0),
+         In_60 = ifelse(observed<=Hi_60 & observed>=Lo_60, 1,0),
+         In_90 = ifelse(observed<=Hi_90 & observed>=Lo_90, 1,0)) 
+
+# TAF_ajustado_InsighTV <- TAF_ajustado %>%
+#               select(date = Date, target = Target, channel = Channel, 
+#                      timeband = TimeBand, 
+#                      `INF Rat%`, `SUP Rat%`) %>% 
+#               mutate(date = as.character(date))
+# 
+# datos_insighTV <- TAF %>%
+#   filter(date == params$date, 
+#          channel %in% c("LAS ESTRELLAS","CANAL 5","NU9VE"),
+#          target != "HOGARES") %>%
+#   left_join(TAF_ajustado_InsighTV) %>%
+#   select(Target = target, Canal = channel, Hora = timeband,VP = modeled,
+#          `Inf 30` = Lo_30,`Sup 30` = Hi_30, 
+#          `Inf 60` = Lo_60,`Sup 60` = Hi_60,
+#          `Inf 90` = Lo_90,`Sup 90` = Hi_90,
+#          `Inf Man` = `INF Rat%`, `Sup Man` = `SUP Rat%`) %>% 
+#   mutate(`Inf QBR` = NA, `Sup QBR` = NA)
+# 
+# export(datos_insighTV,
+#        file= paste0("Datos_insighTV_",as.character(params$date),".xlsx"))
+
+data_all_channels_624 <- rating_all_channels_624 %>% 
+  pivot_longer(cols = `Personas 4+`:`P 19-54 sin DE`, names_to = "Target", values_to = "Rating")
+
+TODAY <- max(data_all_channels_624$Fecha)
+
+variacion_semanal <- data_all_channels_624 %>% 
+  filter(Fecha == TODAY | Fecha == TODAY-7, Dominio=="Mexico", Target == "Personas 4+") %>% 
+  select(-Target, -Year, -Month, -Week, -Month.Day, -Dominio) %>%
+  mutate(Fecha= as.character(Fecha)) %>%
+  cast(Channel~ Fecha) %>%
+  mutate(Variacion = .[[3]]/.[[2]] -1,
+         Diferencia = .[[3]]-.[[2]]) %>%
+  arrange(desc(.[[3]]))
+```
+
+Home {data-orientation=rows}
+============================================================
+
+```{r functions of Home-tab, include = FALSE}
+#Esta función se utiliza para generar el widget con la variación diaria del encendido
+computeArticles = function(...) {
+  por <- paste(round(variacion_semanal[1,4]*100,digits = 2),"%")
+  return(por)
+}
+
+#Esta función se utiliza para generar el widget con los tres canales con mayor variación de encendido en el día.
+computeComments = function(...) {
+  canales_mayor_variacion <- variacion_semanal %>% 
+    filter(Channel!="ENCENDIDOS") %>% 
+    mutate(Diferencia_abs = abs(Diferencia)) %>% 
+    arrange(desc(Diferencia_abs))
+  
+  return(paste(as.character(canales_mayor_variacion[1,1]),
+               "(", round(canales_mayor_variacion[1,5], digits = 0), "), ",
+               as.character(canales_mayor_variacion[2,1]),
+               "(", round(canales_mayor_variacion[2,5], digits = 0), ") y ",
+               as.character(canales_mayor_variacion[3,1]), 
+               "(", round(canales_mayor_variacion[3,5], digits = 0), ")", sep = ""))
+}
+
+#Esta función se utiliza para generar el primer widget del TAF
+computeSpam_1 = function(...){ 
+  a_taf <- datos_taf_rat %>% 
+    filter(channel=="TOTAL ENCENDIDOS") %>% 
+    pull(In_30) %>%  
+    sum() 
+  
+  a_taf <- paste(round(a_taf/36*100, digits = 0), "%")
+    return(a_taf)
+}
+
+#Esta función se utiliza para generar el segundo widget del TAF
+computeSpam_2 = function(...){ 
+  b_taf <- datos_taf_rat %>% 
+    filter(channel=="TOTAL ENCENDIDOS") %>% 
+    pull(In_60) %>%  
+    sum()
+  b_taf <- paste(round(b_taf/36*100, digits = 0), "%")
+  return(b_taf)
+}
+
+#Esta función se utiliza para generar el tercer widget del TAF
+computeSpam_3 = function(...){ 
+  c_taf <- datos_taf_rat %>% 
+    filter(channel=="TOTAL ENCENDIDOS") %>% 
+    pull(In_90) %>%  
+    sum()
+  c_taf <- paste(round(c_taf/36*100, digits = 0), "%")
+  return(c_taf)
+}
+
+#Esta función genera los gráficos comparativos del rating vs el TAF original para cada canal y 
+# ajustado para Las Estrellas, Canal 5 y NU9VE. 
+
+plot_taf <- function(selected.channel){
+  
+  datos_orig <- datos_taf_rat %>% 
+    filter(channel== selected.channel,
+           target == "PERSONAS_4+")
+  
+  datos_taf_ajustados <- TAF_ajustado %>%
+    filter(Channel == selected.channel) %>% 
+    select(target = Target, channel = Channel, 
+           timeband = TimeBand, date = Date, 
+           `INF Rat%`, `SUP Rat%`) %>% 
+    mutate(date = as.character(date))
+  
+  datos <- datos_orig %>% 
+    left_join(datos_taf_ajustados) %>% 
+    select(timeband,
+           `Rating real` = observed,
+           Lo_30,Lo_60,Lo_90, `INF ajustado` = `INF Rat%`,
+           Hi_30,Hi_60,Hi_90, `SUP ajustado` = `SUP Rat%`) %>% 
+    pivot_longer(cols=`Rating real`:`SUP ajustado`, 
+                 names_to = "Confianza", values_to = "Estimación")
+  
+  lab_30 <- round(sum(datos_orig$In_30)/36*100, digits = 0)
+  lab_60 <- round(sum(datos_orig$In_60)/36*100, digits = 0)
+  lab_90 <- round(sum(datos_orig$In_90)/36*100, digits = 0)
+  
+  TYPES <- c("Rating real"= "solid", 
+             "Lo_30"="dotted", "Hi_30"="dotted", 
+             "Lo_60"="solid", "Hi_60"="solid", 
+             "Lo_90"="dashed", "Hi_90"="dashed",
+             "INF ajustado"="twodash","SUP ajustado"="twodash")
+  
+  COLORS <- c("Rating real"= "firebrick1", 
+              "Lo_30"="skyblue", "Hi_30"="skyblue",
+              "Lo_60"="#41CB5A", "Hi_60"="#41CB5A",
+              "Lo_90"="gray54", "Hi_90"="gray54",
+              "INF ajustado" = "#E4852B", "SUP ajustado" = "#E4852B")
+  
+   if(selected.channel%in%c("LAS ESTRELLAS","CANAL 5","NU9VE")){
+    
+    datos %>%
+      ggplot(aes(x=timeband, y = Estimación, color = Confianza, group = Confianza, 
+                 linetype = Confianza))+
+      geom_line() +
+      scale_color_manual(values = COLORS) +
+      scale_linetype_manual(values=TYPES) +
+      geom_point(data = ~subset(., Confianza == "Rating real"),
+                 color = "firebrick1", size = 1, alpha = 0.8) +
+    labs(color= "Valores", x="Timeband", y="Rating") +
+    scale_color_manual("Valores", values=COLORS) +
+    scale_linetype_manual("Valores", values=TYPES) +
+    theme(legend.position = "right") +
+    theme(panel.background = element_rect(fill = "white", colour = "grey50"),
+          panel.grid.major.x = element_line(colour = "lightgray", linetype = "dashed"),
+          panel.grid.minor.x = element_blank()) +
+    geom_text(aes(x=5, y=max(datos_orig$Hi_90)*1.2,
+                  label=paste(lab_30,"% dentro del intervalo al 30%")),
+              color="skyblue", size=5, fontface="bold")+
+    geom_text(aes(x=5, y=max(datos_orig$Hi_90)*1.1,
+                  label=paste(lab_60,"% dentro del intervalo al 60%")),
+              color="#41CB5A", size=5, fontface="bold" )+
+    geom_text(aes(x=5, y=max(datos_orig$Hi_90),
+                  label=paste(lab_90,"% dentro del intervalo al 90%")),
+              color="grey54", size=5, fontface="bold" )
+  }else{
+     TYPES <- TYPES[1:7]
+     COLORS <- COLORS[1:7]
+    
+     datos %>%
+       ggplot(aes(x=timeband, y = Estimación, color = Confianza, group = Confianza, 
+                  linetype = Confianza))+
+       geom_line() +
+       scale_color_manual(values = COLORS) +
+       scale_linetype_manual(values=TYPES) +
+       geom_point(data = ~subset(., Confianza == "Rating real"),
+                  color = "firebrick1", size = 1, alpha = 0.8) +
+       labs(color= "Valores", x="Timeband", y="Rating") +
+       scale_color_manual("Valores", values=COLORS) +
+       scale_linetype_manual("Valores", values=TYPES) +
+       theme(legend.position = "right") +
+       theme(panel.background = element_rect(fill = "white", colour = "grey50"),
+             panel.grid.major.x = element_line(colour = "lightgray", linetype = "dashed"),
+             panel.grid.minor.x = element_blank()) +
+       geom_text(aes(x=5, y=max(datos_orig$Hi_90)*1.2,
+                     label=paste(lab_30,"% dentro del intervalo al 30%")),
+                 color="skyblue", size=5, fontface="bold")+
+       geom_text(aes(x=5, y=max(datos_orig$Hi_90)*1.1,
+                     label=paste(lab_60,"% dentro del intervalo al 60%")),
+                 color="#41CB5A", size=5, fontface="bold" )+
+       geom_text(aes(x=5, y=max(datos_orig$Hi_90),
+                     label=paste(lab_90,"% dentro del intervalo al 90%")),
+                 color="grey54", size=5, fontface="bold" )
+  }
+}
+```
+
+Row {}
+----------------------------------------------------------
+
+### Variación del Encendido
+
+```{r}
+articles = computeArticles()
+flexdashboard::valueBox(articles, icon = "fa-tv", color="white")
+```
+
+### TAF (Intervalo 30%)
+
+```{r}
+spam = computeSpam_1()
+flexdashboard::valueBox(
+  spam, icon = "fa-chart-line",
+  color = ifelse(as.numeric(substr(spam,1,nchar(spam)-2)) < 20, "warning", "success")
+)
+```
+
+### TAF (Intervalo 60%)
+
+```{r}
+spam = computeSpam_2()
+flexdashboard::valueBox(
+  spam, icon = "fa-chart-line",
+  color = ifelse(as.numeric(substr(spam,1,nchar(spam)-2)) < 50, "danger", "success")
+)
+```
+
+### TAF (Intervalo 90%)
+
+```{r}
+spam = computeSpam_3()
+flexdashboard::valueBox(
+  spam, icon = "fa-chart-line",
+  color = ifelse(as.numeric(substr(spam,1,nchar(spam)-2)) < 90, "warning", "success")
+)
+```
+
+Row {}
+----------------------------------------------------------
+
+### Canales con mayor variación
+
+```{r}
+comments = computeComments()
+flexdashboard::valueBox(comments, icon = "fa-chart-pie", color= "white")
+```
+
+Row {.tabset .tabset-fade data-height=400}
+----------------------------------------------------------
+### ENCENDIDOS
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("TOTAL ENCENDIDOS")
+```
+
+### AOT TOTAL
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("AOT TOTAL")
+```
+
+### TV PAGADA
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("TV PAGADA")
+```
+
+### LAS ESTRELLAS
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("LAS ESTRELLAS")
+```
+
+### CANAL 5
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("CANAL 5")
+```
+
+### NU9VE
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("NU9VE")
+```
+
+### FORO TV
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("FORO TV")
+```
+
+### AZTECA UNO
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("AZTECA UNO")
+```
+
+### AZTECA 7
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("AZTECA 7")
+```
+
+### ADN40
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("ADN40")
+```
+
+### A MAS +
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("A MAS +")
+```
+
+### IMAGEN TV
+
+```{r, out.width = '100%', fig.width=15, out.height='140%'}
+plot_taf("IMAGEN TV")
+```
+
+Tracking Encendidos{data-orientation=rows}
+==============================================================
+
+```{r functions of Tracking-Encendidos tab, include=FALSE}
+THISWEEK <- isoweek(TODAY)
+LASTWEEK <- ifelse(THISWEEK==1,52,THISWEEK-1)
+
+THISYEAR.WEEK <- ifelse(THISWEEK==1,year(TODAY)-1,year(TODAY))
+LASTYEAR <- THISYEAR.WEEK-1  
+
+THISMONTH <- month(TODAY)
+LASTMONTH<- ifelse(THISMONTH==1,12,THISMONTH-1)
+
+THISYEAR.MONTH <- ifelse(THISMONTH==1,year(TODAY)-1,year(TODAY))
+
+value <- function(my.day){
+  if (day(my.day)==30) value=31
+  else if (day(my.day)==28 & month(my.day)==2) value=31
+  else value=day(my.day)
+  return(value)
+}
+
+#Esta función genera las tablas para el día previo
+compday <- function(dominio, target){
+  
+  days <- data_all_channels_624 %>% 
+    filter(Fecha == TODAY | Fecha == TODAY-1,
+           Dominio == dominio, Target == target) %>% 
+    select(-Target) %>% 
+    mutate(Fecha = substr(Fecha,3,10)) %>% 
+    cast(Channel~ Fecha)
+  
+  #days$Variacion <- paste(as.character(round((days[,3]/days[,2]-1)*100, digits=2)), "%")
+  days$Variacion <- as.character(round((days[,3]/days[,2]-1)*100, digits=2))
+  
+  days <- days %>% arrange(desc(days[,3]))
+  days$Diferencia <- days[,3]-days[,2]
+  days[,2] <- format(round(days[,2], digits = 0), big.mark = ",")
+  days[,3] <- format(round(days[,3], digits = 0), big.mark = ",")
+  days[,5] <- format(round(days[,5], digits = 0))
+ days %>% 
+   mutate(Diferencia = cell_spec(as.numeric(Diferencia), bold=T,color = ifelse(as.numeric(Diferencia) > 0, "green", "red"))) %>%  
+  kable(caption = "<center><strong><b>DIA PREVIO<b></strong></center>",digits = 2, align = c("c","c","c","c"), format = "html",escape = F) %>%
+    kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "center")
+}
+
+compday2 <- function(dominio, target){
+
+  days <- data_all_channels_624 %>% 
+    filter(Fecha == TODAY | Fecha == TODAY-7,
+           Dominio == dominio, Target == target) %>% 
+    select(-Target) %>% 
+    mutate(Fecha = substr(Fecha,3,10)) %>% 
+    cast(Channel~ Fecha)
+  
+  #days$Variacion <- paste(as.character(round((days[,3]/days[,2]-1)*100, digits=2)), "%")
+  days$Variacion <- as.character(round((days[,3]/days[,2]-1)*100, digits=2))
+                          
+  days <- days %>% arrange(desc(days[,3]))
+  days$Diferencia <- days[,3]-days[,2]
+  days[,2] <- format(round(days[,2], digits = 0), big.mark = ",")
+  days[,3] <- format(round(days[,3], digits = 0), big.mark = ",")
+  days[,5] <- format(round(days[,5], digits = 0))
+  days %>% 
+    mutate(Diferencia = cell_spec(as.numeric(Diferencia), bold=T,color = ifelse(as.numeric(Diferencia) > 0, "green", "red"))) %>% 
+    kable(caption = "<center><strong><b>SEMANA PREVIA<b></strong></center>",digits = 2, align = c("c","c","c","c", "c"), format = "html",escape = F)%>%
+    kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "center")
+}
+
+acumsem <- function(dominio, target){
+  
+    datasemana <- data_all_channels_624 %>% 
+      filter(Year==THISYEAR.WEEK, Week==THISWEEK, Dominio==dominio, Target==target) %>% 
+      mutate(ID = paste("S", THISWEEK, THISYEAR.WEEK))
+    #datasemana <- filter(data, Year%in%c(2021,2022), Week==thisweek, Dominio==dominio, Target==target)
+    datasemant <- data_all_channels_624 %>% 
+      filter(Year== THISYEAR.WEEK , Week==LASTWEEK, Fecha<=TODAY-7, Dominio==dominio, Target==target) %>% 
+      mutate(ID = paste("S", LASTWEEK, THISYEAR.WEEK))
+    #datasemant <- filter(data, Year%in%c(2021,2022), Week==lastweek, Dominio==dominio, Fecha<= lastday-7, Target==target) 
+      
+   datasemly <- data_all_channels_624 %>% 
+     filter(Year==LASTYEAR, Week==THISWEEK, Fecha<=TODAY-364, Dominio==dominio, Target==target) %>% 
+     mutate(ID = paste("S", THISWEEK, LASTYEAR))
+   #  datasemly <- filter(data, Year==2020, Week==thisweek, Fecha<=lastday-365, Dominio==dominio, Target==target)
+    
+  weeks <- bind_rows(datasemana, datasemant, datasemly) %>% 
+    group_by(Dominio, Channel, Year, Week, ID) %>% 
+    summarise("Rating"=mean(`Rating`)) %>% 
+    cast(Channel~ ID, value = "Rating")
+
+  semact <- paste("S", THISWEEK, THISYEAR.WEEK)
+  semant <- paste("S", LASTWEEK, THISYEAR.WEEK)
+  semlye <- paste("S", THISWEEK, LASTYEAR)
+  
+  weeks <- weeks[,c("Channel",semant,semlye,semact)]
+  #weeks$VariaciónLW <- paste(as.character(round((weeks[,4]/weeks[,2]-1)*100, digits=2)), "%")
+  weeks$VariaciónLW <- as.character(round((weeks[,4]/weeks[,2]-1)*100, digits=2))
+  
+  #weeks$VariaciónLY <- paste(as.character(round((weeks[,4]/weeks[,3]-1)*100, digits=2)), "%")
+  weeks$VariaciónLY <- as.character(round((weeks[,4]/weeks[,3]-1)*100, digits=2))
+
+  weeks <- weeks[,c(1,4,2,5,3,6)] 
+  weeks[,2] <- format(round(weeks[,2],digits = 0), big.mark = ",")
+  weeks[,3] <- format(round(weeks[,3],digits = 0), big.mark = ",")
+  weeks[,5] <- format(round(weeks[,5],digits = 0), big.mark = ",")
+  weeks <- weeks %>% arrange(desc(weeks[,2]))
+  
+   weeks %>% 
+   kable(caption = "<center><strong><b>SEMANA PREVIA (PROMEDIO)<b></strong></center>",digits = 2, align = c("c","c","c","c"), format = "html",escape = F) %>%
+    kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "center")
+}
+
+acumes <- function(dominio, target){
+  
+    datames <- data_all_channels_624 %>% 
+      filter(Year==THISYEAR.MONTH, Month==THISMONTH, 
+             Dominio==dominio, Target==target) %>% 
+      mutate(ID = paste("M",THISMONTH, " - Y",THISYEAR.MONTH))
+    
+    datamesant <- data_all_channels_624 %>% 
+      filter(Year==THISYEAR.MONTH, Month==LASTMONTH, Month.Day<=value(TODAY),
+             Dominio==dominio,  Target==target)%>% 
+      mutate(ID = paste("M",LASTMONTH," - Y", THISYEAR.MONTH)) 
+    
+    datamesly <- data_all_channels_624 %>% 
+      filter(Month==THISMONTH, Year==LASTYEAR, Month.Day<= day(TODAY),
+             Dominio==dominio, Target==target)%>% 
+      mutate(ID = paste("M",THISMONTH," - Y", LASTYEAR))
+
+    months <- bind_rows(datames, datamesant, datamesly) %>% 
+      group_by(Dominio, Channel, Year, Month, ID) %>% 
+      summarise("Rating"=mean(`Rating`)) %>% 
+      cast(Channel~ ID)
+    
+    mesact <- paste("M",THISMONTH," - Y",THISYEAR.MONTH)
+    mesant <- paste("M",LASTMONTH," - Y", THISYEAR.MONTH)
+    meslye <- paste("M",THISMONTH," - Y", LASTYEAR)
+    
+    months <- months[,c("Channel",mesant,meslye,mesact)]
+    #months$VariaciónLW <- paste(as.character(round((months[,4]/months[,2]-1)*100, digits=2)), "%")
+    months$VariaciónLW <- as.character(round((months[,4]/months[,2]-1)*100, digits=2))
+    
+    #months$VariaciónLY <- paste(as.character(round((months[,4]/months[,3]-1)*100, digits=2)), "%")
+    months$VariaciónLY <- as.character(round((months[,4]/months[,3]-1)*100, digits=2))
+    
+    months <- months[,c(1,4,2,5,3,6)] 
+    months[,2] <- format(round(months[,2],digits = 0), big.mark = ",")
+    months[,3] <- format(round(months[,3],digits = 0), big.mark = ",")
+    months[,5] <- format(round(months[,5],digits = 0), big.mark = ",")
+ 
+    months <- months %>% arrange(desc(months[,2]))
+    
+    months %>% 
+      kable(caption = "<center><strong><b>MES PREVIO (PROMEDIO)<b></strong></center>",digits = 2, align = c("c","c","c","c"), format = "html",escape = F) %>%
+      kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "center")
+}
+
+acuyr <- function(dominio, target){
+
+    datayr <- data_all_channels_624 %>% 
+      filter(Year==THISYEAR.WEEK, Dominio==dominio, Target==target)
+    dataly <- data_all_channels_624 %>% 
+      filter(Year==LASTYEAR, Fecha<=TODAY-365, Dominio==dominio, Target==target)
+
+    datayr$ID <- paste("Y",THISYEAR.WEEK)
+    dataly$ID <- paste("Y",LASTYEAR)
+    
+    Years <- bind_rows(datayr, dataly) %>% 
+      group_by(Dominio, Channel, Year, ID) %>% 
+      summarise("Rating"=mean(`Rating`)) %>% 
+      cast(Channel~ ID)
+    
+    #Years$VariaciónLY <- paste(as.character(round((Years[,3]/Years[,2]-1)*100, digits=2)), "%")
+    Years$VariaciónLY <- as.character(round((Years[,3]/Years[,2]-1)*100, digits=2))
+                               
+    Years <- Years[,c(1,3,2,4)] 
+    Years[,2] <- format(round(Years[,2],digits = 0), big.mark = ",")
+    Years[,3] <- format(round(Years[,3],digits = 0),big.mark = ",")
+    Years <- Years %>% arrange(desc(Years[,2]))
+    
+    Years %>% 
+      kable(caption = "<center><strong><b>AÑO PREVIO (PROMEDIO)<b></strong></center>",digits = 2, align = c("c","c","c","c"), format = "html",escape = F) %>%
+      kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "center")
+}
+```
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Total Personas", "", icon = icon(""))
+```
+
+Row {data-height=1050 .tabset .tabset-fade}
+----------------------------------------------------------
+  
+### Mexico 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Mexico", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Mexico", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Mexico", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Mexico", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Mexico", "Personas 4+")
+```
+</div>
+
+
+### AMCM 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("DF", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("DF", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("DF", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("DF", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("DF", "Personas 4+")
+```
+</div>
+
+### Interior 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Interior (25 Ciudades)", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Interior (25 Ciudades)", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Interior (25 Ciudades)", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Interior (25 Ciudades)", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Interior (25 Ciudades)", "Personas 4+")
+```
+</div>
+
+### Guadalajara 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Guadalajara", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Guadalajara", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Guadalajara", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Guadalajara", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Guadalajara", "Personas 4+")
+```
+</div>
+
+### Monterrey 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Monterrey", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Monterrey", "Personas 4+")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Monterrey", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Monterrey", "Personas 4+")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Monterrey", "Personas 4+")
+```
+</div>
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Amas de casa", "", icon = icon(""))
+```
+
+Row {data-height=1050 .tabset .tabset-fade}
+----------------------------------------------------------
+
+### Mexico 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Mexico", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Mexico", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Mexico", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Mexico", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Mexico", "Amas de Casa")
+```
+</div>
+
+
+### AMCM 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("DF", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("DF", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("DF", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("DF", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("DF", "Amas de Casa")
+```
+</div>
+
+### Interior 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Interior (25 Ciudades)", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Interior (25 Ciudades)", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Interior (25 Ciudades)", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Interior (25 Ciudades)", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Interior (25 Ciudades)", "Amas de Casa")
+```
+</div>
+
+### Guadalajara 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Guadalajara", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Guadalajara", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Guadalajara", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Guadalajara", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Guadalajara", "Amas de Casa")
+```
+</div>
+
+### Monterrey 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Monterrey", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Monterrey", "Amas de Casa")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Monterrey", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Monterrey", "Amas de Casa")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Monterrey", "Amas de Casa")
+```
+</div>
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Personas 19 a 54 sin NSE DE", "", icon = icon(""))
+```
+
+Row {data-height=1050 .tabset .tabset-fade}
+----------------------------------------------------------
+
+### Mexico 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Mexico", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Mexico", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Mexico", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Mexico", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Mexico", "P 19-54 sin DE")
+```
+</div>
+
+
+### AMCM 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("DF", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("DF", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("DF", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("DF", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("DF", "P 19-54 sin DE")
+```
+</div>
+
+### Interior 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Interior (25 Ciudades)", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Interior (25 Ciudades)", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Interior (25 Ciudades)", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Interior (25 Ciudades)", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Interior (25 Ciudades)", "P 19-54 sin DE")
+```
+</div>
+
+### Guadalajara 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Guadalajara", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Guadalajara", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Guadalajara", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Guadalajara", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Guadalajara", "P 19-54 sin DE")
+```
+</div>
+
+### Monterrey 
+
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday("Monterrey", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+compday2("Monterrey", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-4">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acuyr("Monterrey", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumsem("Monterrey", "P 19-54 sin DE")
+```
+</div>
+<div class="col-md-6">
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+acumes("Monterrey", "P 19-54 sin DE")
+```
+</div>
+
+Dailytrack Encendidos {data-orientation=rows}
+============================================================
+
+```{r functions for PUT curves, include=FALSE}
+simpleCap <- function(x) {
+  s <- strsplit(x, " ")[[1]]
+  paste(toupper(substring(s, 1,1)), substring(s, 2),
+        sep="", collapse=" ")
+}
+
+#Bases para generar los gráficos
+LAST_WEEK <- TODAY-3*7
+Sys.setlocale("LC_TIME", "ES_ES.UTF-8")
+DIA <- simpleCap(weekdays(TODAY))
+Sys.setlocale("LC_TIME", "ES_ES.UTF-8")
+DIA_SPANISH <- str_to_title(weekdays(TODAY))
+encendidos_semanal <- filter(encendidos,
+                             Date>= LAST_WEEK & substr(Week.Day,4,nchar(Week.Day)) == substr(DIA,4,nchar(DIA)))
+encendidos_dias <- filter(encendidos, Date>=TODAY-3)
+
+
+plot_curves <- function(db,region, target){  
+  #Esta función genera los gráficos comparativos de semanas previas y de días previos. 
+  data <- filter(db, Region==region, Target==target)
+  texto <- ifelse(length(unique(data$Week.Day))>1, enc2utf8("Dias"), DIA_SPANISH)
+  unique(as.character(data$Date))
+  ggplot(data = data,
+         aes(x=Start.Time, y=rat, group=Date, colour=as.character(Date))) +
+    geom_line(size=1.2) + 
+    labs(title = paste(texto, " previos - ",region, " - ", target), colour="Fecha") + 
+    scale_x_discrete(breaks=c("06:00", "07:00", "08:00", "09:00", "10:00", "11:00", "12:00",
+                              "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", 
+                              "20:00", "21:00", "22:00", "23:00","23:59"), 
+                     labels=c("06", "07", "08", "09", "10", "11", "12", "13", "14","15", "16",
+                              "17", "18", "19", "20", "21", "22", "23", "24")) + 
+    scale_colour_manual(values=c("#A6A6A6","#7F7F7F","#00B050","#FF0000")) + 
+    theme(panel.background = element_rect(fill = "white", colour = "lightgray"),
+          panel.grid.major.x = element_line(colour = "lightgray", linetype = "dashed"), 
+          panel.grid.minor.x = element_blank(), 
+          legend.position = c(.07,.85), 
+          legend.title = element_text(face="bold"), 
+          plot.title = element_text(face="bold", size=20)) + 
+    xlab("Timeband")+ylab("Rating Miles")
+}
+
+```
+
+Row {data-height=60 .tabset .tabset-fade}
+----------------------------------------------------------
+
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Total Personas", "", icon = icon(""))
+```
+
+Row {.tabset .tabset-fade}
+----------------------------------------------------------
+
+### México
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Mexico", "Personas 4+")
+b <- plot_curves(encendidos_dias, "Mexico", "Personas 4+")
+
+plot_grid(a,b, ncol = 2)
+```
+
+### AMCM 
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "DF", "Personas 4+")
+b <- plot_curves(encendidos_dias, "DF", "Personas 4+")
+plot_grid(a,b, ncol = 2)
+```
+
+### Interior
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Interior (25 Ciudades)", "Personas 4+")
+b <- plot_curves(encendidos_dias, "Interior (25 Ciudades)", "Personas 4+")
+plot_grid(a,b, ncol = 2)
+```
+
+### Guadalajara
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Guadalajara", "Personas 4+")
+b <- plot_curves(encendidos_dias, "Guadalajara", "Personas 4+")
+plot_grid(a,b, ncol = 2)
+```
+
+### Monterrey
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Monterrey", "Personas 4+")
+b <- plot_curves(encendidos_dias, "Monterrey", "Personas 4+")
+plot_grid(a,b, ncol = 2)
+```
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Amas de Casa", "", icon = icon(""))
+```
+
+Row {.tabset .tabset-fade}
+----------------------------------------------------------------------------------------------------------------
+
+### México
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Mexico", "Amas de Casa")
+b <- plot_curves(encendidos_dias, "Mexico", "Amas de Casa")
+plot_grid(a,b, ncol = 2)
+```
+
+### AMCM 
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "DF", "Amas de Casa")
+b <- plot_curves(encendidos_dias, "DF", "Amas de Casa")
+plot_grid(a,b, ncol = 2)
+```
+
+### Interior
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Interior (25 Ciudades)", "Amas de Casa")
+b <- plot_curves(encendidos_dias, "Interior (25 Ciudades)", "Amas de Casa")
+plot_grid(a,b, ncol = 2)
+```
+
+### Guadalajara
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Guadalajara", "Amas de Casa")
+b <- plot_curves(encendidos_dias, "Guadalajara", "Amas de Casa")
+plot_grid(a,b, ncol = 2)
+```
+
+### Monterrey
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Monterrey", "Amas de Casa")
+b <- plot_curves(encendidos_dias, "Monterrey", "Amas de Casa")
+plot_grid(a,b, ncol = 2)
+```
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Personas 19 a 54 sin NSE DE", "", icon = icon(""))
+```
+
+Row {.tabset .tabset-fade}
+----------------------------------------------------------
+
+### México
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Mexico", "P 19-54 sin DE")
+b <- plot_curves(encendidos_dias, "Mexico", "P 19-54 sin DE")
+plot_grid(a,b, ncol = 2)
+```
+
+
+### AMCM 
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "DF", "P 19-54 sin DE")
+b <- plot_curves(encendidos_dias, "DF", "P 19-54 sin DE")
+plot_grid(a,b, ncol = 2)
+```
+
+### Interior
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Interior (25 Ciudades)", "P 19-54 sin DE")
+b <- plot_curves(encendidos_dias, "Interior (25 Ciudades)", "P 19-54 sin DE")
+plot_grid(a,b, ncol = 2)
+```
+
+### Guadalajara
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Guadalajara", "P 19-54 sin DE")
+b <- plot_curves(encendidos_dias, "Guadalajara", "P 19-54 sin DE")
+plot_grid(a,b, ncol = 2)
+```
+
+### Monterrey
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE, fig.width=20}
+a <- plot_curves(encendidos_semanal, "Monterrey", "P 19-54 sin DE")
+b <- plot_curves(encendidos_dias, "Monterrey", "P 19-54 sin DE")
+plot_grid(a,b, ncol = 2)
+```
+
+
+Tracking Encendidos por Franjas horarias{data-orientation=rows}
+==============================================================
+
+```{r functions of Tracking-Encendidos por Franjas horarias tab, include=FALSE}
+#THISWEEK <- isoweek(TODAY)
+LASTWEEK <- ifelse(THISWEEK==1,52,THISWEEK-1)
+
+THISYEAR.WEEK <- ifelse(THISWEEK==1,year(TODAY)-1,year(TODAY))
+LASTYEAR <- THISYEAR.WEEK-1  
+
+THISMONTH <- month(TODAY)
+LASTMONTH<- ifelse(THISMONTH==1,12,THISMONTH-1)
+
+THISYEAR.MONTH <- ifelse(THISMONTH==1,year(TODAY)-1,year(TODAY))
+
+value <- function(my.day){
+  if (day(my.day)==30) value=31
+  else if (day(my.day)==28 & month(my.day)==2) value=31
+  else value=day(my.day)
+  return(value)
+}
+
+#Dia previo
+prevday<-function(dominio,target){
+#dominio="Mexico";target="Amas de Casa"
+#dominio="DF"; target="P 19-54 sin DE"
+  dataVarFranjas<-read.table(paste0(DIRECTORIO,"/EncendidosPorFranja.txt"),sep = "|", header = TRUE, colClasses = c(NA, rep("character",5),"numeric"))
+
+names(dataVarFranjas)<-c("X","Dominio","Fecha","Channel","Target","TimeBand","Rating")
+#dataVarFranjas$Fecha
+days2 <- dataVarFranjas %>% 
+  filter(Fecha == TODAY | Fecha == TODAY-1,
+         Dominio == dominio, Target == target) %>% 
+  select(-Target) %>% 
+  mutate(Fecha = substr(Fecha,3,10))
+  
+franja1<-days2 %>% 
+  filter(TimeBand =="06:00:00 - 24:00:00") %>% 
+  select(-TimeBand)  %>% 
+  cast(Channel~Fecha) 
+
+Variacion <- paste(as.character(round((franja1[,3]/franja1[,2]-1)*100, digits=2)))
+Variacion[is.na(as.numeric(Variacion))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/21
+Variacion[is.infinite(as.numeric(Variacion))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/22
+Diferencia <-round(franja1[,3]-franja1[,2], digits = 0)
+Diferencia[is.na(as.numeric(Diferencia))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/22
+
+franja2<-days2 %>% 
+  filter(TimeBand =="06:00:00 - 12:00:00") %>% 
+  select(-TimeBand) %>% 
+  cast(Channel~Fecha)
+
+Variacion2 <- paste(as.character(round((franja2[,3]/franja2[,2]-1)*100, digits=2)))
+Variacion2[is.na(as.numeric(Variacion2))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/21
+Variacion2[is.infinite(as.numeric(Variacion2))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/22
+Diferencia2 <- round(franja2[,3]-franja2[,2], digits = 0)
+Diferencia2[is.na(as.numeric(Diferencia2))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/22
+
+franja3<-days2 %>% 
+  filter(TimeBand =="12:00:00 - 18:00:00") %>% 
+  select(-TimeBand) %>% 
+  cast(Channel~Fecha)
+
+Variacion3 <- paste(as.character(round((franja3[,3]/franja3[,2]-1)*100, digits=2)))
+Variacion3[is.na(as.numeric(Variacion3))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/21
+Variacion3[is.infinite(as.numeric(Variacion3))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/22
+Diferencia3 <- round(franja3[,3]-franja3[,2], digits = 0)
+Diferencia3[is.na(as.numeric(Diferencia3))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/22
+
+franja4<-days2 %>% 
+  filter(TimeBand =="18:00:00 - 24:00:00") %>% 
+  select(-TimeBand) %>% 
+  cast(Channel~Fecha)
+
+Variacion4 <- paste(as.character(round((franja4[,3]/franja4[,2]-1)*100, digits=2)))
+Variacion4[is.na(as.numeric(Variacion4))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/21
+Variacion4[is.infinite(as.numeric(Variacion4))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/22
+Diferencia4 <- round(franja4[,3]-franja4[,2], digits = 0)
+Diferencia4[is.na(as.numeric(Diferencia4))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/22
+
+FranjasPorc<-cbind(franja1$Channel,Variacion,Variacion2,Variacion3,Variacion4)
+FranjasAbs<-cbind(franja1$Channel,Diferencia,Diferencia2,Diferencia3,Diferencia4)
+FranjasPorc<-as.data.frame(FranjasPorc)
+FranjasAbs<-as.data.frame(FranjasAbs)
+
+#variacion %
+names(FranjasPorc)<-c("Channel","6-24","6-12","12-18","18-24")
+FranjasPorc$Channel<-c("A MAS +","ADN40","AOT TOTAL","AZTECA 7","AZTECA UNO","CANAL 5","FORO TV","IMAGEN TV","LAS ESTRELLAS","NU9VE","RESTO TV PAGADA","TELEVISA NETWORKS","ENCENDIDOS","TOTAL LOCALES TVSA","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL TV AZTECA","TV ABIERTA","TV PAGADA")
+orden<-c("ENCENDIDOS","TV ABIERTA","TV PAGADA","TELEVISA NETWORKS","RESTO TV PAGADA","AOT TOTAL","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL LOCALES TVSA","TOTAL TV AZTECA","AZTECA UNO","LAS ESTRELLAS","IMAGEN TV","FORO TV","CANAL 5","AZTECA 7","NU9VE","ADN40","A MAS +")
+
+FranjasPorc<-FranjasPorc[match(orden,FranjasPorc$Channel),]
+
+Porc<-FranjasPorc %>% 
+ mutate("6-24" = gsub("$","%",cell_spec(FranjasPorc$`6-24`, bold=T,color = 
+ifelse(as.numeric(FranjasPorc$`6-24`) > 0,"green", "red")))) %>%   #ifelse(as.numeric(str_sub(FranjasPorc$`6-24`,end=-2L)) > 0,"green", "red"))))) %>% #excluir str_sub(), Cristina OM 2023/09/22
+  kable(caption = "<center><strong><b>VARIACIÓN PORCENTUAL<b></strong></center>",digits = 2, align = c("c","c","c","c","c"), format = "html",escape = F,row.names =F) %>% 
+  kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "right") 
+
+#Variacion absoluta
+names(FranjasAbs)<-c("Channel","6-24","6-12","12-18","18-24")
+FranjasAbs$Channel<-c("A MAS +","ADN40","AOT TOTAL","AZTECA 7","AZTECA UNO","CANAL 5","FORO TV","IMAGEN TV","LAS ESTRELLAS","NU9VE","RESTO TV PAGADA","TELEVISA NETWORKS","ENCENDIDOS","TOTAL LOCALES TVSA","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL TV AZTECA","TV ABIERTA","TV PAGADA")
+orden<-c("ENCENDIDOS","TV ABIERTA","TV PAGADA","TELEVISA NETWORKS","RESTO TV PAGADA","AOT TOTAL","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL LOCALES TVSA","TOTAL TV AZTECA","AZTECA UNO","LAS ESTRELLAS","IMAGEN TV","FORO TV","CANAL 5","AZTECA 7","NU9VE","ADN40","A MAS +")
+
+FranjasAbs<-FranjasAbs[match(orden,FranjasAbs$Channel),]
+
+Abs<-FranjasAbs %>% 
+ mutate("6-24" = cell_spec(as.numeric(FranjasAbs$`6-24`), bold=T,color = ifelse(as.numeric(FranjasAbs$`6-24`) > 0, "green", "red"))) %>%  
+  kable(caption = "<center><strong><b>VARIACIÓN ABSOLUTA<b></strong></center>",digits = 2, align = c("c","c","c","c","c"), format = "html",escape = F,row.names =F) %>%
+  kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "left") 
+
+return(list(Porc,Abs))
+
+}
+
+#semana previa
+prevweek<-function(dominio,target){
+dataVarFranjas<-read.table(paste0(DIRECTORIO,"/EncendidosPorFranja.txt"),sep = "|", header = TRUE,
+                           colClasses = c(NA, rep("character",5),"numeric"))
+names(dataVarFranjas)<-c("X","Dominio","Fecha","Channel","Target","TimeBand","Rating")
+#dataVarFranjas$Fecha
+days3 <- dataVarFranjas %>% 
+  filter(Fecha == TODAY | Fecha == TODAY-7,
+         Dominio == dominio, Target == target) %>% 
+  select(-Target) %>% 
+  mutate(Fecha = substr(Fecha,3,10))
+##
+franja1w<-days3 %>% 
+  filter(TimeBand =="06:00:00 - 24:00:00") %>% 
+  select(-TimeBand) %>% 
+  cast(Channel~Fecha)
+
+#Variacionw <- paste(as.character(round((franja1w[,3]/franja1w[,2]-1)*100, digits=2)), "%") 
+Variacionw <- as.character(round((franja1w[,3]/franja1w[,2]-1)*100, digits=2))
+Variacionw[is.na(as.numeric(Variacionw))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+Variacionw[is.infinite(as.numeric(Variacionw))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/27
+
+Diferenciaw <-round(franja1w[,3]-franja1w[,2], digits = 0) 
+Diferenciaw[is.na(as.numeric(Diferenciaw))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+
+
+franja2w<-days3 %>% 
+  filter(TimeBand =="06:00:00 - 12:00:00") %>% 
+  select(-TimeBand) %>% 
+  cast(Channel~Fecha)
+
+#Variacion2w<- paste(as.character(round((franja2w[,3]/franja2w[,2]-1)*100, digits=2)), "%")
+Variacion2w<- as.character(round((franja2w[,3]/franja2w[,2]-1)*100, digits=2))
+Variacion2w[is.na(as.numeric(Variacion2w))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+Variacion2w[is.infinite(as.numeric(Variacion2w))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/27
+
+Diferencia2w <- round(franja2w[,3]-franja2w[,2], digits = 0)
+Diferencia2w[is.na(as.numeric(Diferencia2w))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+
+franja3w<-days3 %>% 
+  filter(TimeBand =="12:00:00 - 18:00:00") %>% 
+  select(-TimeBand) %>% 
+  cast(Channel~Fecha)
+
+#Variacion3w <- paste(as.character(round((franja3w[,3]/franja3w[,2]-1)*100, digits=2)), "%")
+Variacion3w <- as.character(round((franja3w[,3]/franja3w[,2]-1)*100, digits=2))
+Variacion3w[is.na(as.numeric(Variacion3w))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+Variacion3w[is.infinite(as.numeric(Variacion3w))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/27
+                     
+Diferencia3w <- round(franja3w[,3]-franja3w[,2], digits = 0)
+Diferencia3w[is.na(as.numeric(Diferencia3w))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+
+franja4w<-days3 %>% 
+  filter(TimeBand =="18:00:00 - 24:00:00") %>% 
+  select(-TimeBand) %>% 
+  cast(Channel~Fecha)
+#Variacion4w <- paste(as.character(round((franja4w[,3]/franja4w[,2]-1)*100, digits=2)), "%")
+Variacion4w <- as.character(round((franja4w[,3]/franja4w[,2]-1)*100, digits=2))
+Variacion4w[is.na(as.numeric(Variacion4w))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+Variacion4w[is.infinite(as.numeric(Variacion4w))]<-0 #CAMBIA Inf por 0, Cristina OM 2023/09/27
+                     
+Diferencia4w <- round(franja4w[,3]-franja4w[,2], digits = 0)
+Diferencia4w[is.na(as.numeric(Diferencia4w))] <- 0  #CAMBIA NaN o NA por 0, Cristina OM 2023/09/27
+
+FranjasPorcw<-cbind(franja1w$Channel,Variacionw,Variacion2w,Variacion3w,Variacion4w)
+FranjasAbsw<-cbind(franja1w$Channel,Diferenciaw,Diferencia2w,Diferencia3w,Diferencia4w)
+FranjasPorcw<-as.data.frame(FranjasPorcw)
+FranjasAbsw<-as.data.frame(FranjasAbsw)
+
+### porcentaje
+names(FranjasPorcw)<-c("Channel","6-24","6-12","12-18","18-24")
+FranjasPorcw$Channel<-c("A MAS +","ADN40","AOT TOTAL","AZTECA 7","AZTECA UNO","CANAL 5","FORO TV","IMAGEN TV","LAS ESTRELLAS","NU9VE","RESTO TV PAGADA","TELEVISA NETWORKS","ENCENDIDOS","TOTAL LOCALES TVSA","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL TV AZTECA","TV ABIERTA","TV PAGADA")
+orden<-c("ENCENDIDOS","TV ABIERTA","TV PAGADA","TELEVISA NETWORKS","RESTO TV PAGADA","AOT TOTAL","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL LOCALES TVSA","TOTAL TV AZTECA","AZTECA UNO","LAS ESTRELLAS","IMAGEN TV","FORO TV","CANAL 5","AZTECA 7","NU9VE","ADN40","A MAS +")
+
+FranjasPorcw<-FranjasPorcw[match(orden,FranjasPorcw$Channel),]
+#
+Porcw<-FranjasPorcw %>% 
+  mutate("6-24" = gsub("$","%",cell_spec(FranjasPorcw$`6-24`, bold=T,color = ifelse(as.numeric(FranjasPorcw$`6-24`) > 0, "green", "red")))) %>% #ifelse(as.numeric(str_sub(FranjasPorcw$`6-24`,end=-2L)) > 0, "green", "red")))) %>% #excluir str_sub, Cristina OM 2023/09/22
+  kable(caption = "<center><strong><b>VARIACIÓN PORCENTUAL<b></strong></center>",digits = 2, align = c("c","c","c","c","c"), format = "html",escape = F,row.names = F) %>%
+  #add_header_above(c(""=1, "6:00-12:00"=2,"12:00-18:00"=2,"18:00-24:00"=2),escape=F) %>% 
+ kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "right") 
+
+#absoluta
+names(FranjasAbsw)<-c("Channel","6-24","6-12","12-18","18-24")
+FranjasAbsw$Channel<-c("A MAS +","ADN40","AOT TOTAL","AZTECA 7","AZTECA UNO","CANAL 5","FORO TV","IMAGEN TV","LAS ESTRELLAS","NU9VE","RESTO TV PAGADA","TELEVISA NETWORKS","ENCENDIDOS","TOTAL LOCALES TVSA","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL TV AZTECA","TV ABIERTA","TV PAGADA")
+orden<-c("ENCENDIDOS","TV ABIERTA","TV PAGADA","TELEVISA NETWORKS","RESTO TV PAGADA","AOT TOTAL","TOTAL TELEVISA","TOTAL TVSA ABIERTA","TOTAL LOCALES TVSA","TOTAL TV AZTECA","AZTECA UNO","LAS ESTRELLAS","IMAGEN TV","FORO TV","CANAL 5","AZTECA 7","NU9VE","ADN40","A MAS +")
+
+FranjasAbsw<-FranjasAbsw[match(orden,FranjasAbsw$Channel),]
+#
+Absw<-FranjasAbsw %>% 
+  mutate("6-24" = cell_spec(as.numeric(FranjasAbsw$`6-24`), bold=T,color = ifelse(as.numeric(FranjasAbsw$`6-24`) > 0, "green", "red"))) %>% 
+  kable(caption = "<center><strong><b>VARIACIÓN ABSOLUTA<b></strong></center>",digits = 2, align = c("c","c","c","c","c"), format = "html",escape = F,row.names = F) %>%
+  #add_header_above(c(""=1, "6:00-12:00"=2,"12:00-18:00"=2,"18:00-24:00"=2),escape=F) %>% 
+ kable_styling(bootstrap_options = "condensed", full_width = FALSE, font_size = 12,position = "left")
+return(list(Porcw,Absw))
+}
+
+```
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Total Personas", "", icon = icon(""))
+```
+
+Row {data-height=1350 .tabset .tabset-fade}
+----------------------------------------------------------
+  
+### Mexico 
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Mexico", "BI_02_P 04+")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Mexico", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Mexico", "BI_02_P 04+")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Mexico", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+### AMCM 
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("DF", "BI_02_P 04+")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("DF", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("DF", "BI_02_P 04+")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("DF", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+### Interior 
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Interior (25 Ciudades)", "BI_02_P 04+")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Interior (25 Ciudades)", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Interior (25 Ciudades)", "BI_02_P 04+")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Interior (25 Ciudades)", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+### Guadalajara 
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Guadalajara", "BI_02_P 04+")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Guadalajara", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Guadalajara", "BI_02_P 04+")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Guadalajara", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+### Monterrey
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Monterrey", "BI_02_P 04+")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Monterrey", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Monterrey", "BI_02_P 04+")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Monterrey", "BI_02_P 04+")[[2]]
+```
+</div>
+</div>
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Amas de Casa", "", icon = icon(""))
+```
+
+Row {data-height=1350 .tabset .tabset-fade}
+----------------------------------------------------------
+
+### Mexico
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Mexico", "Amas de Casa")[[1]] #cambio "Amas de Casa" por "Amas de Casa", Cristina OM 20231016
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Mexico", "Amas de Casa")[[2]] #cambio "Amas de Casa" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Mexico", "Amas de Casa")[[1]] #cambio "Amas de Casa" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Mexico", "Amas de Casa")[[2]] #cambio "Amas de Casa" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+### AMCM
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("DF", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("DF", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("DF", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("DF", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+### Interior
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Interior (25 Ciudades)", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Interior (25 Ciudades)", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Interior (25 Ciudades)", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Interior (25 Ciudades)", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+### Guadalajara
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Guadalajara", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Guadalajara", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Guadalajara", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Guadalajara", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+### Monterrey
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Monterrey", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Monterrey", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Monterrey", "Amas de Casa")[[1]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Monterrey", "Amas de Casa")[[2]] #cambio "AMAS DE CASA" por "Amas de Casa", Cristina OM 20231016
+```
+</div>
+</div>
+
+Row {data-height=60 data-align=center}
+---------------------------------------------------------------------------------------------------------------
+### {.colored}
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+valueBox("Personas 19 a 54 sin NSE DE", "", icon = icon(""))
+```
+
+Row {data-height=1350 .tabset .tabset-fade}
+----------------------------------------------------------
+
+### Mexico
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Mexico", "P 19-54 sin DE")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Mexico", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Mexico", "P 19-54 sin DE")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Mexico", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+### AMCM
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("DF", "P 19-54 sin DE")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("DF", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("DF", "P 19-54 sin DE")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("DF", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+### Interior
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Interior (25 Ciudades)", "P 19-54 sin DE")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Interior (25 Ciudades)", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Interior (25 Ciudades)", "P 19-54 sin DE")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Interior (25 Ciudades)", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+### Guadalajara
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Guadalajara", "P 19-54 sin DE")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Guadalajara", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Guadalajara", "P 19-54 sin DE")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Guadalajara", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+### Monterrey
+<center>
+<font size="5" color="#424242">Día Previo</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Monterrey", "P 19-54 sin DE")[[1]]
+
+```
+</div>
+<div>
+```{r colapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevday("Monterrey", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
+
+<center>
+<font size="5" color="#424242">Semana Previa</font>
+</center>
+
+
+<div style="display:flex; flex-direction:row; justify-content:space-evenly; align-items:center;">
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Monterrey", "P 19-54 sin DE")[[1]]
+```
+</div>
+<div>
+```{r collapse=TRUE, echo=FALSE, message=FALSE, warning=FALSE, fig.width=20}
+prevweek("Monterrey", "P 19-54 sin DE")[[2]]
+```
+</div>
+</div>
